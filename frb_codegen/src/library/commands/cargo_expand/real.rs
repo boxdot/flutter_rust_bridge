@@ -1,3 +1,4 @@
+use super::CODEGEN_RUNNING_ENV;
 use crate::codegen::dumper::Dumper;
 use crate::codegen::ConfigDumpContent;
 use crate::command_args;
@@ -11,6 +12,7 @@ use lazy_static::lazy_static;
 use log::{debug, info};
 use regex::{Captures, Regex};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -81,7 +83,8 @@ fn run_raw(
         .map(PathBuf::from_str)
         .try_collect()?;
 
-    let args = command_args!(
+    let target_dir = env::var_os("OUT_DIR").map(|path| PathBuf::from(path).join("frb-expand"));
+    let mut args = command_args!(
         "expand",
         "--lib",
         "--theme=none",
@@ -90,11 +93,28 @@ fn run_raw(
         *args_features
     );
 
-    let extra_env = [(
-        "RUSTFLAGS".to_owned(),
-        env::var("RUSTFLAGS").map(|x| x + " ").unwrap_or_default() + extra_rustflags,
-    )]
+    if let Some(target_dir) = target_dir {
+        args.extend([PathBuf::from("--target-dir"), target_dir]);
+        if let Some(target) = env::var_os("TARGET") {
+            args.extend([PathBuf::from("--target"), PathBuf::from(target)]);
+        }
+    }
+
+    let mut extra_env: HashMap<String, String> = [
+        (
+            "RUSTFLAGS".to_owned(),
+            env::var("RUSTFLAGS").map(|x| x + " ").unwrap_or_default() + extra_rustflags,
+        ),
+        (CODEGEN_RUNNING_ENV.to_owned(), "1".to_owned()),
+    ]
     .into();
+
+    if let Ok(flags) = env::var("CARGO_ENCODED_RUSTFLAGS") {
+        extra_env.insert(
+            "CARGO_ENCODED_RUSTFLAGS".to_owned(),
+            append_encoded_rustflags(&flags, extra_rustflags),
+        );
+    }
 
     let output = execute_command(
         "cargo",
@@ -129,6 +149,14 @@ fn run_raw(
     }
 
     Ok(stdout.lines().skip(1).join("\n"))
+}
+
+fn append_encoded_rustflags(existing: &str, extra: &str) -> String {
+    existing
+        .split('\u{1f}')
+        .filter(|flag| !flag.is_empty())
+        .chain(extra.split_whitespace())
+        .join("\u{1f}")
 }
 
 fn install_cargo_expand() -> Result<()> {
@@ -176,8 +204,61 @@ fn cargo_expand_install_args(version: Option<&str>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cargo_expand_fallback_version, cargo_expand_install_args};
+    use super::{
+        append_encoded_rustflags, cargo_expand_fallback_version, cargo_expand_install_args,
+        decode_macro_frb_encoded_comments,
+    };
 
+    /// Build-script encoded flags preserve arguments and include the expansion cfg.
+    #[test]
+    fn test_encoded_rustflags_preserve_existing_arguments() {
+        assert_eq!(
+            append_encoded_rustflags("--cfg\u{1f}custom=\"with spaces\"", "--cfg frb_expand"),
+            "--cfg\u{1f}custom=\"with spaces\"\u{1f}--cfg\u{1f}frb_expand"
+        );
+        assert_eq!(
+            append_encoded_rustflags("", "--cfg frb_expand"),
+            "--cfg\u{1f}frb_expand"
+        );
+    }
+
+    /// Decodes every encoded macro comment, including adjacent comments.
+    #[test]
+    fn test_decode_macro_frb_encoded_comments_decodes_multiple_adjacent_comments() {
+        let code = concat!(
+            "#[doc = \"frb_encoded(666f6f)\"]",
+            "#[doc = \"frb_encoded(626172)\"]"
+        );
+
+        assert_eq!(decode_macro_frb_encoded_comments(code), "foobar");
+    }
+
+    /// Decodes a macro comment whose attribute formatting spans lines.
+    #[test]
+    fn test_decode_macro_frb_encoded_comments_decodes_multiline_attribute() {
+        let code = "#[doc =\n \"frb_encoded(666f6f)\"]";
+
+        assert_eq!(decode_macro_frb_encoded_comments(code), "foo");
+    }
+
+    /// Borrows the original code when no encoded macro comment is present.
+    #[test]
+    fn test_decode_macro_frb_encoded_comments_keeps_unmatched_code_borrowed() {
+        let code = "#[doc = \"ordinary documentation\"]";
+        let decoded = decode_macro_frb_encoded_comments(code);
+
+        assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(decoded, code);
+    }
+
+    /// Panics for invalid encoded-comment payloads, preserving the existing contract.
+    #[test]
+    #[should_panic]
+    fn test_decode_macro_frb_encoded_comments_panics_for_invalid_hex() {
+        let _ = decode_macro_frb_encoded_comments("#[doc = \"frb_encoded(not-hex)\"]");
+    }
+
+    /// Selects the pinned fallback when the latest cargo-expand needs newer Rust.
     #[test]
     fn test_cargo_expand_fallback_version_when_latest_requires_newer_rustc() {
         let stderr =
@@ -185,11 +266,24 @@ mod tests {
         assert_eq!(cargo_expand_fallback_version(stderr), Some("1.0.112"));
     }
 
+    /// Does not select a fallback for unrelated installation errors.
     #[test]
     fn test_cargo_expand_fallback_version_when_error_is_unrelated() {
         assert_eq!(cargo_expand_fallback_version("network timeout"), None);
     }
 
+    /// Uses the unpinned latest cargo-expand installation arguments by default.
+    #[test]
+    fn test_cargo_expand_install_args_for_latest() {
+        let args = cargo_expand_install_args(None);
+        let args = args
+            .into_iter()
+            .map(|item| item.into_os_string().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["install", "cargo-expand"]);
+    }
+
+    /// Pins and locks cargo-expand when installing the compatibility fallback.
     #[test]
     fn test_cargo_expand_install_args_for_fallback_uses_locked() {
         let args = cargo_expand_install_args(Some("1.0.112"));

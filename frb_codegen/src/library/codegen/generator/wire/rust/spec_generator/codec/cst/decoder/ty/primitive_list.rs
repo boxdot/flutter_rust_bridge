@@ -55,19 +55,17 @@ impl WireRustCodecCstGeneratorDecoderTrait for PrimitiveListWireRustCodecCstGene
             // frb-coverage:ignore-end
             MirTypePrimitive::I64 | MirTypePrimitive::U64 => Some(
                 format!(
-                    "let buf = self.dyn_into::<{}>().unwrap();
-                    let buf = flutter_rust_bridge::for_generated::js_sys::Uint8Array::new(&buf.buffer());
-                    flutter_rust_bridge::for_generated::slice_from_byte_buffer(buf.to_vec()).into()",
-                    rust_web_wire_type(&self.mir)
+                    "self.dyn_into::<{}>().unwrap().to_vec().into()",
+                    rust_web_wire_type(&self.mir),
                 )
-                    .into(),
+                .into(),
             ),
             _ => Some(
                 format!(
                     "self.unchecked_into::<{}>().to_vec().into()",
                     rust_web_wire_type(&self.mir)
                 )
-                    .into(),
+                .into(),
             ),
         }
     }
@@ -132,6 +130,40 @@ fn rust_web_wire_type(mir: &MirTypePrimitiveList) -> &str {
         MirTypePrimitive::F64 => "flutter_rust_bridge::for_generated::js_sys::Float64Array",
         MirTypePrimitive::Bool | MirTypePrimitive::Unit => {
             "flutter_rust_bridge::for_generated::js_sys::Array"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Maps every primitive family to its JavaScript wire array.
+    #[test]
+    fn rust_web_wire_type_covers_every_primitive_family() {
+        let cases = [
+            (MirTypePrimitive::U8, "Uint8Array"),
+            (MirTypePrimitive::I8, "Int8Array"),
+            (MirTypePrimitive::U16, "Uint16Array"),
+            (MirTypePrimitive::I16, "Int16Array"),
+            (MirTypePrimitive::U32, "Uint32Array"),
+            (MirTypePrimitive::Usize, "Uint32Array"),
+            (MirTypePrimitive::I32, "Int32Array"),
+            (MirTypePrimitive::Isize, "Int32Array"),
+            (MirTypePrimitive::U64, "BigUint64Array"),
+            (MirTypePrimitive::I64, "BigInt64Array"),
+            (MirTypePrimitive::F32, "Float32Array"),
+            (MirTypePrimitive::F64, "Float64Array"),
+            (MirTypePrimitive::Bool, "Array"),
+            (MirTypePrimitive::Unit, "Array"),
+        ];
+
+        for (primitive, expected_suffix) in cases {
+            let mir = MirTypePrimitiveList {
+                primitive,
+                strict_dart_type: true,
+            };
+            assert!(rust_web_wire_type(&mir).ends_with(expected_suffix));
         }
     }
 }

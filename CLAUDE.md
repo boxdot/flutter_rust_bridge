@@ -10,6 +10,11 @@
 | `*.freezed.dart` | Freezed output |
 | `*.g.dart` | Code generator output |
 
+### PR size and complexity
+
+- When humans describe a PR as large or complex, generated code is excluded.
+- Keep implementations as simple as possible while preserving correctness.
+
 ### Feature flags
 
 When adding or testing feature flags, read `frb-feature-flag`.
@@ -26,4 +31,5 @@ When adding or testing feature flags, read `frb-feature-flag`.
 - `frb-prepare-pr` - PR preparation
 - `frb-fix-ci` - CI fixes
 - `frb-fix-main-ci` - Default-branch CI regression triage
-- `frb-docker` - Docker/devcontainer usage and dev image publishing
+- `frb-docker` - Ordinary Docker/devcontainer usage and local validation
+- `frb-upgrade-docker` - Dev Docker toolchain upgrades, candidate images, and stable publication

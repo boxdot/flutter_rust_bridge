@@ -452,7 +452,9 @@ Future<void> main() async {
   await RustLib.init();
 
   final success = await directRunTests(
-    () async => callFileEntrypoints(),
+    () async {
+      await callFileEntrypoints(skipDisposedRustAutoOpaqueArgumentTest: true);
+    },
     reporterFactory: (engine) => ExpandedReporter.watch(
       engine,
       PrintSink(),
@@ -461,11 +463,15 @@ Future<void> main() async {
       printPath: false,
     ),
   );
+  print('FRB_DART_TEST_RESULT: ${success ? 'success' : 'failure'}');
 
-  exit(success ? 0 : 1);
+  RustLib.dispose();
+  exitCode = success ? 0 : 1;
 }
 
-Future<void> callFileEntrypoints() async {
+Future<void> callFileEntrypoints({
+  bool skipDisposedRustAutoOpaqueArgumentTest = false,
+}) async {
   final entrypoints = <Future<void> Function({bool skipRustLibInit})>[
     array_test.main,
     async_misc_test.main,
@@ -653,13 +659,23 @@ Future<void> callFileEntrypoints() async {
     rust_auto_opaque_twin_moi_test.main,
     rust_auto_opaque_twin_rust_async_moi_test.main,
     rust_auto_opaque_twin_rust_async_sse_moi_test.main,
-    rust_auto_opaque_twin_rust_async_sse_test.main,
+    ({bool skipRustLibInit = false}) =>
+        rust_auto_opaque_twin_rust_async_sse_test.main(
+          skipRustLibInit: skipRustLibInit,
+          skipDisposedRustAutoOpaqueArgumentTest:
+              skipDisposedRustAutoOpaqueArgumentTest,
+        ),
     rust_auto_opaque_twin_rust_async_test.main,
     rust_auto_opaque_twin_sse_moi_test.main,
     rust_auto_opaque_twin_sse_test.main,
     rust_auto_opaque_twin_sync_moi_test.main,
     rust_auto_opaque_twin_sync_sse_moi_test.main,
-    rust_auto_opaque_twin_sync_sse_test.main,
+    ({bool skipRustLibInit = false}) =>
+        rust_auto_opaque_twin_sync_sse_test.main(
+          skipRustLibInit: skipRustLibInit,
+          skipDisposedRustAutoOpaqueArgumentTest:
+              skipDisposedRustAutoOpaqueArgumentTest,
+        ),
     rust_auto_opaque_twin_sync_test.main,
     rust_opaque_sync_twin_moi_test.main,
     rust_opaque_sync_twin_sse_moi_test.main,

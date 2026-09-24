@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_rust_bridge_internal/src/frb_example_pure_dart_generator/generator.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/build.dart';
+import 'package:flutter_rust_bridge_internal/src/makefile_dart/build_cli.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/consts.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/generate.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/generate_from_scratch.dart';
@@ -9,11 +10,240 @@ import 'package:flutter_rust_bridge_internal/src/makefile_dart/lint.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/post_release.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/quickstart_smoke.dart';
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/release.dart';
-import 'package:flutter_rust_bridge_internal/src/makefile_dart/released_version.dart';
+import 'package:flutter_rust_bridge_internal/src/makefile_dart/released_version.dart'
+    as released_version;
 import 'package:flutter_rust_bridge_internal/src/makefile_dart/test.dart';
+import 'package:flutter_rust_bridge_internal/src/misc/dart_sanitizer_tester/dart_sdk.dart';
+import 'package:flutter_rust_bridge_internal/src/misc/dart_sanitizer_tester/runner.dart';
+import 'package:flutter_rust_bridge_internal/src/misc/dart_sanitizer_tester/sanitizer.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('known thread suppressions are limited to their TSAN entrypoints', () {
+    for (final package in [
+      'frb_example/pure_dart_pde',
+      'frb_example/pure_dart',
+      'frb_example/deliberate_bad',
+      'frb_example/dart_minimal',
+    ]) {
+      for (final sanitizer in Sanitizer.values) {
+        final environment = sanitizerEntrypointEnvironmentForTesting(
+          package: package,
+          sanitizer: sanitizer,
+          environment: const {'TSAN_OPTIONS': 'halt_on_error=1'},
+        );
+        expect(
+          Map.of(environment)..remove('LSAN_OPTIONS'),
+          (package == 'frb_example/pure_dart_pde' ||
+                      package == 'frb_example/pure_dart') &&
+                  sanitizer == Sanitizer.tsan
+              ? {
+                  'TSAN_OPTIONS':
+                      'halt_on_error=1:report_thread_leaks=1:'
+                      'print_suppressions=1:'
+                      'suppressions=../../tools/dart_tsan_${package.endsWith('_pde') ? 'pde' : 'pure'}.supp',
+                }
+              : <String, String>{},
+        );
+      }
+    }
+  });
+
+  test('CST leak suppressions apply only to pure Dart leak detectors', () {
+    for (final package in kDartModeOfPackage.keys) {
+      for (final sanitizer in Sanitizer.values) {
+        final environment = sanitizerEntrypointEnvironmentForTesting(
+          package: package,
+          sanitizer: sanitizer,
+          environment: const {'LSAN_OPTIONS': 'verbosity=1'},
+        );
+        expect(
+          environment['LSAN_OPTIONS'],
+          package == 'frb_example/pure_dart' &&
+                  (sanitizer == Sanitizer.asan || sanitizer == Sanitizer.lsan)
+              ? 'verbosity=1:detect_leaks=1:exitcode=23:print_suppressions=1:'
+                    'suppressions=../../tools/dart_lsan_cst.supp'
+              : isNull,
+        );
+      }
+    }
+  });
+
+  test('CST leak suppression rejects unknown rules and excess leaks', () {
+    const rule =
+        '^frbgen_frb_example_pure_dart_cst_new_list_RustOpaque_HideDataTwinMoi\$';
+    const report =
+        '-----------------------------------------------------\n'
+        'Suppressions used:\n'
+        '  count bytes template\n'
+        '     36   576 $rule\n'
+        '-----------------------------------------------------\n';
+    expect(() => checkCstLeakSuppressionForTesting(''), returnsNormally);
+    expect(() => checkCstLeakSuppressionForTesting(report), returnsNormally);
+    final secondRule = rule.replaceAll('TwinMoi', 'TwinNormal');
+    final multiple = report.replaceAll(
+      '36   576 $rule',
+      '20 320 $rule\n16 256 $secondRule',
+    );
+    expect(() => checkCstLeakSuppressionForTesting(multiple), returnsNormally);
+    for (final unexpected in [
+      multiple.replaceAll('16 256', '17 256'),
+      multiple.replaceAll('16 256', '16 257'),
+      report.replaceAll('36   576', '37   576'),
+      report.replaceAll('36   576', '36   577'),
+      report.replaceAll(rule, 'frb_rust_vec_u8_new'),
+      report.replaceAll(rule, '*'),
+      report.replaceAll('36   576 $rule', '36   576 $rule\n1 16 $rule'),
+      '$report$report',
+      'Suppressions used:\nmalformed\n',
+    ]) {
+      expect(
+        () => checkCstLeakSuppressionForTesting(unexpected),
+        throwsException,
+      );
+    }
+    expect(
+      () => checkSanitizerResultForTesting(
+        exitCode: 23,
+        stdout: 'FRB_DART_TEST_RESULT: success',
+        stderr: '$report\nERROR: LeakSanitizer: detected memory leaks',
+        expectSucceed: true,
+      ),
+      throwsException,
+    );
+  });
+
+  test('CST leak suppression accepts the complete known CI workload', () {
+    final report = File('test/fixtures/cst_lsan_suppressions.txt')
+        .readAsStringSync();
+    expect(() => checkCstLeakSuppressionForTesting(report), returnsNormally);
+  });
+
+  test('LSAN rules name only the observed CST container allocators', () {
+    final rules = File('../../tools/dart_lsan_cst.supp').readAsLinesSync();
+    final expected = {
+      for (final kind in ['enum_opaque', 'opaque_nested'])
+        for (final variant in [
+          'moi',
+          'normal',
+          'rust_async',
+          'rust_async_moi',
+          'sync',
+          'sync_moi',
+        ])
+          'leak:^frbgen_frb_example_pure_dart_cst_new_box_autoadd_${kind}_twin_$variant\$',
+      for (final variant in [
+        'Moi',
+        'Normal',
+        'RustAsync',
+        'RustAsyncMoi',
+        'Sync',
+        'SyncMoi',
+      ])
+        'leak:^frbgen_frb_example_pure_dart_cst_new_list_RustOpaque_HideDataTwin$variant\$',
+    };
+    expect(rules.toSet(), expected);
+    expect(rules.length, expected.length);
+  });
+
+  test('PDE thread suppression accepts only one known creation path', () {
+    const rule =
+        'thread:frb_example_pure_dart_pde::api::async_spawn::'
+        'simple_use_async_spawn_blocking::';
+    expect(
+      File('../../tools/dart_tsan_pde.supp').readAsStringSync(),
+      '$rule\n',
+    );
+    const report =
+        'ThreadSanitizer: Matched 1 suppressions (pid=123):\n'
+        '1 $rule\n';
+    expect(() => checkPdeThreadLeakSuppressionForTesting(''), returnsNormally);
+    expect(
+      () => checkPdeThreadLeakSuppressionForTesting(report),
+      returnsNormally,
+    );
+    for (final unexpected in [
+      report.replaceAll('Matched 1', 'Matched 2'),
+      report.replaceAll('1 thread:', '2 thread:'),
+      report.replaceAll('thread:', 'race:'),
+      report.replaceAll('simple_use_async_spawn_blocking::', 'different_api::'),
+      '$report$report',
+      'ThreadSanitizer: Matched malformed summary\n',
+    ]) {
+      expect(
+        () => checkPdeThreadLeakSuppressionForTesting(unexpected),
+        throwsException,
+      );
+    }
+  });
+
+  test('pure thread suppression accepts only its one known creation path', () {
+    const rule =
+        'thread:frb_example_pure_dart::api::async_spawn::'
+        'simple_use_async_spawn_blocking::';
+    expect(
+      File('../../tools/dart_tsan_pure.supp').readAsStringSync(),
+      '$rule\n',
+    );
+    const report =
+        'ThreadSanitizer: Matched 1 suppressions (pid=123):\n'
+        '1 $rule\n';
+    expect(() => checkPureThreadLeakSuppressionForTesting(''), returnsNormally);
+    expect(
+      () => checkPureThreadLeakSuppressionForTesting(report),
+      returnsNormally,
+    );
+    for (final unexpected in [
+      report.replaceAll('Matched 1', 'Matched 2'),
+      report.replaceAll('1 thread:', '2 thread:'),
+      report.replaceAll('thread:', 'race:'),
+      report.replaceAll('simple_use_async_spawn_blocking::', 'different_api::'),
+      report.replaceAll('pure_dart::', 'pure_dart_pde::'),
+      '$report$report',
+      'ThreadSanitizer: Matched malformed summary\n',
+    ]) {
+      expect(
+        () => checkPureThreadLeakSuppressionForTesting(unexpected),
+        throwsException,
+      );
+    }
+    expect(
+      () => checkPdeThreadLeakSuppressionForTesting(report),
+      throwsException,
+    );
+  });
+
+  test('dart valgrind command uses the Dart AOT suppression file', () {
+    expect(
+      dartValgrindCommandForTesting(),
+      contains('--suppressions=../../tools/dart_valgrind.supp'),
+    );
+    expect(File('../../tools/dart_valgrind.supp').existsSync(), true);
+  });
+
+  test('dart valgrind command treats only checked leak kinds as errors', () {
+    expect(dartValgrindCommandForTesting(), contains('--error-exitcode=1'));
+    expect(
+      dartValgrindCommandForTesting(),
+      contains('--errors-for-leak-kinds=definite,indirect'),
+    );
+  });
+
+  test('Valgrind suppresses only the known CST allocators', () {
+    final suppressions = File('../../tools/dart_valgrind.supp')
+        .readAsStringSync();
+    expect(
+      RegExp(r'fun:(frbgen_\S+)').allMatches(suppressions).map((m) => m[1]),
+      [
+        'frbgen_frb_example_pure_dart_cst_new_box_speed_twin_sync',
+        'frbgen_frb_example_pure_dart_cst_new_box_autoadd_note_twin_sync',
+        'frbgen_frb_example_pure_dart_cst_new_list_RustOpaque_HideDataTwinMoi',
+        'frbgen_frb_example_pure_dart_cst_new_list_RustOpaque_HideDataTwinMoi',
+      ],
+    );
+    expect(suppressions, isNot(contains('frb_rust_vec_u8_new')));
+  });
+
   test('dart valgrind compile command uses dart build output directory', () {
     expect(
       dartValgrindCompileCommandForTesting(),
@@ -33,6 +263,182 @@ void main() {
       dartValgrindOutputExecutablePathForTesting(),
       'build/valgrind_test_output/bundle/bin/dart_valgrind_test_entrypoint',
     );
+  });
+
+  test('sanitized Dart release defaults to checked-in artifact tag', () {
+    expect(
+      sanitizedDartReleaseName(environment: {}),
+      kDefaultSanitizedDartReleaseName,
+    );
+  });
+
+  test('sanitized Dart release can be overridden by environment', () {
+    expect(
+      sanitizedDartReleaseName(
+        environment: {'FRB_SANITIZED_DART_RELEASE_NAME': ' Build_test '},
+      ),
+      'Build_test',
+    );
+  });
+
+  test('sanitized Dart cache path remains outside the repository', () {
+    expect(
+      sanitizedDartCacheRelativePathForTesting(
+        repoRootPath:
+            '/home/runner/work/flutter_rust_bridge/flutter_rust_bridge',
+        cacheRootPath: '/tmp/frb_sanitized_dart/release',
+      ),
+      '../../../../../tmp/frb_sanitized_dart/release',
+    );
+  });
+
+  test('sanitized Dart version check is skipped without main Dart env', () {
+    checkSanitizedDartVersionForTesting(
+      versionOutput: 'Dart SDK version: 3.11.0 (stable)',
+      environment: {},
+    );
+  });
+
+  test('sanitized Dart version check accepts matching main Dart env', () {
+    checkSanitizedDartVersionForTesting(
+      versionOutput: 'Dart SDK version: 3.11.0 (stable)',
+      environment: {'FRB_MAIN_DART_VERSION': '3.11.0'},
+    );
+  });
+
+  test('sanitized Dart version check rejects stale artifact version', () {
+    expect(
+      () => checkSanitizedDartVersionForTesting(
+        versionOutput: 'Dart SDK version: 3.10.0 (stable)',
+        environment: {'FRB_MAIN_DART_VERSION': '3.11.0'},
+      ),
+      throwsA(
+        isA<Exception>().having(
+          (error) => error.toString(),
+          'message',
+          contains('Build a new sanitized Dart artifact'),
+        ),
+      ),
+    );
+  });
+
+  test('ASAN rustflags keep production runtime semantics', () {
+    expect(
+      sanitizerRustflagsForTesting(Sanitizer.asan),
+      '-Zsanitizer=address -Zmerge-functions=disabled -Cdebuginfo=1',
+    );
+  });
+
+  test('sanitizer rustflags keep full MSAN instrumentation', () {
+    expect(
+      sanitizerRustflagsForTesting(Sanitizer.msan),
+      '-Zsanitizer=memory -Zmerge-functions=disabled -Cdebuginfo=1',
+    );
+  });
+
+  test('LSAN rustflags keep production runtime semantics', () {
+    expect(
+      sanitizerRustflagsForTesting(Sanitizer.lsan),
+      '-Zsanitizer=leak -Zmerge-functions=disabled -Cdebuginfo=1',
+    );
+  });
+
+  test('TSAN rustflags preserve production synchronization semantics', () {
+    expect(
+      sanitizerRustflagsForTesting(Sanitizer.tsan),
+      '-Zsanitizer=thread -Zmerge-functions=disabled -Cdebuginfo=1',
+    );
+  });
+
+  test(
+    'sanitizer entrypoints reject every nonzero exit regardless of report',
+    () {
+      const knownReport =
+          '==123==ERROR: LeakSanitizer: detected memory leaks\n'
+          'Direct leak of 16 byte(s) in 1 object(s) allocated from:\n'
+          '    #0 0x1234  (/tmp/sdk/out/dartvm+0x217a63f) '
+          '(BuildId: abcdef)\n'
+          '    #1 0xabcd known_runtime_function '
+          '(libfrb_example_pure_dart.so+0x11f0446) (BuildId: 012345)\n'
+          'SUMMARY: LeakSanitizer: 16 byte(s) leaked in 1 allocation(s).\n';
+      final unrelatedStackReport = knownReport.replaceFirst(
+        'known_runtime_function',
+        'new_regression_function',
+      );
+      final unstableValuesChanged = knownReport
+          .replaceAll('0x1234', '0x9999')
+          .replaceAll('0xabcd', '0x8888')
+          .replaceAll('==123==', '==987==')
+          .replaceAll('/tmp/sdk/out/dartvm', '/other/sdk/dartvm')
+          .replaceAll('abcdef', 'fedcba')
+          .replaceAll('012345', '543210');
+      for (final exitCode in [1, 23, 66, 137, -9]) {
+        for (final report in [
+          '',
+          knownReport,
+          'ERROR: AddressSanitizer: heap-use-after-free\n$knownReport',
+          'WARNING: ThreadSanitizer: data race\n$knownReport',
+          'SUMMARY: LeakSanitizer: 16 byte(s) leaked in 1 allocation(s).\n',
+          unrelatedStackReport,
+          unstableValuesChanged,
+          '$knownReport\n$unrelatedStackReport',
+        ]) {
+          expect(
+            () => checkSanitizerResultForTesting(
+              exitCode: exitCode,
+              stdout: 'FRB_DART_TEST_RESULT: success',
+              stderr: report,
+              expectSucceed: true,
+              expectStdoutContains: 'FRB_DART_TEST_RESULT: success',
+            ),
+            throwsException,
+            reason: 'Nonzero exit $exitCode must not be forgiven by a report',
+          );
+        }
+      }
+    },
+  );
+
+  test('sanitizer entrypoints require their success marker on stdout', () {
+    const marker = 'FRB_DART_TEST_RESULT: success';
+    for (final stdout in ['', 'FRB_DART_TEST_RESULT: failure', marker]) {
+      expect(
+        () => checkSanitizerResultForTesting(
+          exitCode: 0,
+          stdout: stdout,
+          stderr: marker,
+          expectSucceed: true,
+          expectStdoutContains: marker,
+        ),
+        stdout == marker ? returnsNormally : throwsException,
+      );
+    }
+  });
+
+  test('sanitizer negative controls require failure and the diagnostic', () {
+    for (final diagnostic in [
+      'ERROR: AddressSanitizer: heap-use-after-free',
+      'ERROR: LeakSanitizer: detected memory leaks',
+      'WARNING: MemorySanitizer: use-of-uninitialized-value',
+      'WARNING: ThreadSanitizer: data race',
+    ]) {
+      for (final exitCode in [0, 1, 23, 66]) {
+        for (final stderr in ['', 'unrelated failure', diagnostic]) {
+          expect(
+            () => checkSanitizerResultForTesting(
+              exitCode: exitCode,
+              stdout: diagnostic,
+              stderr: stderr,
+              expectSucceed: false,
+              expectStderrContains: diagnostic,
+            ),
+            exitCode != 0 && stderr == diagnostic
+                ? returnsNormally
+                : throwsException,
+          );
+        }
+      }
+    }
   });
 
   test('linux build bundle path follows the current machine architecture', () {
@@ -92,8 +498,7 @@ void main() {
   test('release guard rejects uninitialized submodules', () {
     expect(
       () => verifyReleaseSubmodules(
-        submoduleStatus:
-            '-6f7144d frb_codegen/assets/integration_template/cargokit/app/rust_builder/cargokit',
+        submoduleStatus: '-6f7144d frb_codegen/assets/integration_template/cargokit/app/rust_builder/cargokit',
       ),
       throwsA(
         isA<Exception>().having(
@@ -134,9 +539,8 @@ void main() {
     'pure dart generator resolves package from repo root instead of cwd',
     () {
       expect(
-        pureDartUriForTesting(
-          repoRootPath: '/workspace/flutter_rust_bridge/',
-        ).toFilePath(),
+        pureDartUriForTesting(repoRootPath: '/workspace/flutter_rust_bridge/')
+            .toFilePath(),
         '/workspace/flutter_rust_bridge/frb_example/pure_dart/',
       );
     },
@@ -183,53 +587,47 @@ late final callback = ptr.asFunction<voidFunction(ffi.Pointer<ffi.Void>)>();
     );
   });
 
-  test(
-    'integrate Cargo.lock source of truth keeps local crate after flutter_rust_bridge',
-    () {
-      for (final (package, crateName) in [
-        (
-          'frb_example/flutter_via_create/rust/Cargo.lock',
-          'rust_lib_flutter_via_create',
-        ),
-        (
-          'frb_example/flutter_via_integrate/rust/Cargo.lock',
-          'rust_lib_flutter_via_integrate',
-        ),
-        (
-          'frb_example/flutter_via_create_native_assets/rust/Cargo.lock',
-          'rust_lib_flutter_via_create_native_assets',
-        ),
-        (
-          'frb_example/flutter_via_integrate_native_assets/rust/Cargo.lock',
-          'rust_lib_flutter_via_integrate_native_assets',
-        ),
-      ]) {
-        final content = File('../../$package').readAsStringSync();
-        final localCrateIndex = content.indexOf('name = "$crateName"');
-        final frbIndex = content.indexOf('name = "flutter_rust_bridge"');
+  test('integrate Cargo.lock source of truth keeps local crate after flutter_rust_bridge', () {
+    for (final (package, crateName) in [
+      (
+        'frb_example/flutter_via_create/rust/Cargo.lock',
+        'rust_lib_flutter_via_create',
+      ),
+      (
+        'frb_example/flutter_via_integrate/rust/Cargo.lock',
+        'rust_lib_flutter_via_integrate',
+      ),
+      (
+        'frb_example/flutter_via_create_native_assets/rust/Cargo.lock',
+        'rust_lib_flutter_via_create_native_assets',
+      ),
+      (
+        'frb_example/flutter_via_integrate_native_assets/rust/Cargo.lock',
+        'rust_lib_flutter_via_integrate_native_assets',
+      ),
+    ]) {
+      final content = File('../../$package').readAsStringSync();
+      final localCrateIndex = content.indexOf('name = "$crateName"');
+      final frbIndex = content.indexOf('name = "flutter_rust_bridge"');
 
-        expect(localCrateIndex, greaterThanOrEqualTo(0), reason: package);
-        expect(frbIndex, greaterThanOrEqualTo(0), reason: package);
-        expect(localCrateIndex, greaterThan(frbIndex), reason: package);
-      }
-    },
-  );
+      expect(localCrateIndex, greaterThanOrEqualTo(0), reason: package);
+      expect(frbIndex, greaterThanOrEqualTo(0), reason: package);
+      expect(localCrateIndex, greaterThan(frbIndex), reason: package);
+    }
+  });
 
-  test(
-    'resolveBuildWebPackage uses replacement package for flutter package example',
-    () {
-      expect(
-        resolveBuildWebPackage('frb_example/flutter_package/example'),
-        'frb_example/flutter_package',
-      );
-      expect(
-        resolveBuildWebPackage(
-          'frb_example/flutter_package_native_assets/example',
-        ),
-        'frb_example/flutter_package_native_assets',
-      );
-    },
-  );
+  test('resolveBuildWebPackage uses replacement package for flutter package example', () {
+    expect(
+      resolveBuildWebPackage('frb_example/flutter_package/example'),
+      'frb_example/flutter_package',
+    );
+    expect(
+      resolveBuildWebPackage(
+        'frb_example/flutter_package_native_assets/example',
+      ),
+      'frb_example/flutter_package_native_assets',
+    );
+  });
 
   test('resolveBuildWebPackage keeps package when no replacement exists', () {
     expect(
@@ -253,12 +651,73 @@ plain
     );
   });
 
+  test('build_cli state is restored when internal generation fails', () async {
+    final tempDir = await Directory.systemTemp.createTemp('frb_build_cli_');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final pubspecs = [
+      File('${tempDir.path}/frb_dart/pubspec.yaml'),
+      File('${tempDir.path}/frb_utils/pubspec.yaml'),
+    ];
+    const disabledContents = '''
+dev_dependencies:
+  # Temporarily remove before https://github.com/kevmoo/build_cli/issues/168 is fixed
+  # build_cli: ^2.2.5
+''';
+    for (final pubspec in pubspecs) {
+      await pubspec.parent.create(recursive: true);
+      await pubspec.writeAsString(disabledContents);
+    }
+
+    await expectLater(
+      withBuildCliEnabled(
+        repoRootPath: tempDir.path,
+        action: () async {
+          for (final pubspec in pubspecs) {
+            expect(
+              await pubspec.readAsString(),
+              contains('\n  build_cli: ^2.2.5'),
+            );
+          }
+          throw StateError('generation failed');
+        },
+      ),
+      throwsStateError,
+    );
+    for (final pubspec in pubspecs) {
+      expect(await pubspec.readAsString(), disabledContents);
+    }
+  });
+
+  test('build_cli validates every pubspec before changing files', () async {
+    final tempDir = await Directory.systemTemp.createTemp('frb_build_cli_');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final firstPubspec = File('${tempDir.path}/frb_dart/pubspec.yaml');
+    final secondPubspec = File('${tempDir.path}/frb_utils/pubspec.yaml');
+    await firstPubspec.parent.create(recursive: true);
+    await secondPubspec.parent.create(recursive: true);
+    const disabledContents = '''
+dev_dependencies:
+  # Temporarily remove before https://github.com/kevmoo/build_cli/issues/168 is fixed
+  # build_cli: ^2.2.5
+''';
+    await firstPubspec.writeAsString(disabledContents);
+    await secondPubspec.writeAsString('dev_dependencies:\n');
+
+    await expectLater(
+      withBuildCliEnabled(repoRootPath: tempDir.path, action: () async {}),
+      throwsStateError,
+    );
+    expect(await firstPubspec.readAsString(), disabledContents);
+  });
+
   test('from-scratch selection keeps every tracked generated output', () {
     expect(
       selectTrackedGeneratedFilesForFromScratchForTesting([
         'frb_example/example/frb_generated.h',
         'frb_example/example/lib/src/rust/frb_generated.dart',
+        'frb_example/example/lib/src/rust/api/model.dart',
         'frb_example/example/lib/src/rust/api/model.freezed.dart',
+        'frb_example/example/lib/src/rust/third_party/binding.dart',
         'frb_example/example/lib/unrelated_model.g.dart',
         'frb_example/rust_ui/src/frb_generated.rs',
         'frb_rust/src/internal_generated/mod.rs',
@@ -271,7 +730,9 @@ plain
       [
         'frb_example/example/frb_generated.h',
         'frb_example/example/lib/src/rust/frb_generated.dart',
+        'frb_example/example/lib/src/rust/api/model.dart',
         'frb_example/example/lib/src/rust/api/model.freezed.dart',
+        'frb_example/example/lib/src/rust/third_party/binding.dart',
         'frb_example/example/lib/unrelated_model.g.dart',
         'frb_example/rust_ui/src/frb_generated.rs',
         'frb_rust/src/internal_generated/mod.rs',
@@ -372,6 +833,37 @@ plain
     );
   });
 
+  test('quickstart smoke selects the built macOS app regardless of name', () {
+    final package = Directory.systemTemp.createTempSync('quickstart-app-');
+    addTearDown(() => package.deleteSync(recursive: true));
+    final products = '${package.path}/build/macos/Build/Products/Debug';
+    final app = Directory('$products/flutter_via_create_native_assets.app')
+      ..createSync(recursive: true);
+    Directory('$products/FlutterMacOS.framework').createSync();
+    File('$products/not-an-app.app').writeAsStringSync('');
+
+    expect(quickstartSmokeMacosAppPathForTesting(package), app.absolute.path);
+  });
+
+  test('quickstart smoke rejects missing or ambiguous macOS apps', () {
+    final package = Directory.systemTemp.createTempSync('quickstart-app-');
+    addTearDown(() => package.deleteSync(recursive: true));
+    final products = Directory(
+      '${package.path}/build/macos/Build/Products/Debug',
+    )..createSync(recursive: true);
+
+    expect(
+      () => quickstartSmokeMacosAppPathForTesting(package),
+      throwsStateError,
+    );
+    Directory('${products.path}/first.app').createSync();
+    Directory('${products.path}/second.app').createSync();
+    expect(
+      () => quickstartSmokeMacosAppPathForTesting(package),
+      throwsStateError,
+    );
+  });
+
   test(
     'quickstart smoke waits for Flutter run readiness before screenshot',
     () {
@@ -394,6 +886,16 @@ plain
         QuickstartSmokeTarget.ios,
       ),
       const Duration(minutes: 10),
+    );
+  });
+
+  test('quickstart smoke disables DDS for Android runs', () {
+    expect(
+      quickstartSmokeFlutterRunArgsForTesting(
+        target: QuickstartSmokeTarget.android,
+        deviceId: 'emulator-5554',
+      ),
+      ['run', '-d', 'emulator-5554', '--no-dds'],
     );
   });
 
@@ -552,7 +1054,7 @@ plain
   group('release version check', () {
     test('parses crates.io package metadata', () {
       expect(
-        parseCratesIoReleasedVersion({
+        released_version.parseCratesIoReleasedVersion({
           'crate': {'max_version': '2.12.0'},
         }),
         '2.12.0',
@@ -561,7 +1063,7 @@ plain
 
     test('parses pub.dev package metadata', () {
       expect(
-        parsePubDevReleasedVersion({
+        released_version.parsePubDevReleasedVersion({
           'latest': {'version': '2.12.0'},
         }),
         '2.12.0',
@@ -570,7 +1072,7 @@ plain
 
     test('finds pub.dev prerelease target version outside latest', () {
       expect(
-        parsePubDevReleasedVersion({
+        released_version.parsePubDevReleasedVersion({
           'latest': {'version': '2.12.0'},
           'versions': [
             {'version': '2.12.0'},
@@ -582,14 +1084,14 @@ plain
     });
 
     test('summarizes whether every package is published', () {
-      final output = buildReleasePackageStatusOutput([
-        const ReleasePackageStatus(
+      final output = released_version.buildReleasePackageStatusOutput([
+        const released_version.ReleasePackageStatus(
           registry: 'crates.io',
           name: 'flutter_rust_bridge',
           manifestVersion: '2.12.0',
           releasedVersion: '2.12.0',
         ),
-        const ReleasePackageStatus(
+        const released_version.ReleasePackageStatus(
           registry: 'pub.dev',
           name: 'flutter_rust_bridge',
           manifestVersion: '2.12.0',
@@ -617,7 +1119,7 @@ plain
     });
 
     test('uses explicit target version for every published package', () async {
-      final statuses = await fetchReleasePackageStatuses(
+      final statuses = await released_version.fetchReleasePackageStatuses(
         targetVersion: '9.9.9',
         fetcher: (uri) async {
           if (uri.host == 'crates.io') {
@@ -651,7 +1153,7 @@ plain
     test(
       'reports hooks as unreleased when its target version is absent',
       () async {
-        final statuses = await fetchReleasePackageStatuses(
+        final statuses = await released_version.fetchReleasePackageStatuses(
           targetVersion: '9.9.9',
           fetcher: (uri) async {
             if (uri.host == 'crates.io') {
@@ -670,7 +1172,9 @@ plain
           },
         );
 
-        final output = buildReleasePackageStatusOutput(statuses);
+        final output = released_version.buildReleasePackageStatusOutput(
+          statuses,
+        );
         final hooksStatus = statuses.singleWhere(
           (status) => status.name == 'flutter_rust_bridge_hooks',
         );
@@ -683,7 +1187,7 @@ plain
     test(
       'reports hooks as unreleased when only another version exists',
       () async {
-        final statuses = await fetchReleasePackageStatuses(
+        final statuses = await released_version.fetchReleasePackageStatuses(
           targetVersion: '9.9.9',
           fetcher: (uri) async {
             if (uri.host == 'crates.io') {
@@ -703,7 +1207,9 @@ plain
           },
         );
 
-        final output = buildReleasePackageStatusOutput(statuses);
+        final output = released_version.buildReleasePackageStatusOutput(
+          statuses,
+        );
         final hooksStatus = statuses.singleWhere(
           (status) => status.name == 'flutter_rust_bridge_hooks',
         );
@@ -716,9 +1222,8 @@ plain
     test(
       'uses each local Dart manifest version as its pub.dev target',
       () async {
-        final rustVersion = getWorkspaceRustVersion();
-
-        final statuses = await fetchReleasePackageStatuses(
+        final rustVersion = released_version.getWorkspaceRustVersion();
+        final statuses = await released_version.fetchReleasePackageStatuses(
           dartPackageManifestFetcher: (package) => switch (package) {
             'frb_dart' =>
               '''
@@ -853,10 +1358,10 @@ version: 9.9.8
   });
 
   group('test checkValgrindOutput', () {
-    test('good', () {
-      checkValgrindOutput('''
-00:00 +1: All tests passed!
-
+    test('accepts a clean run', () {
+      checkValgrindOutput(
+        stdout: '00:00 +1: All tests passed!',
+        stderr: '''
 ==3667== LEAK SUMMARY:
 ==3667==    definitely lost: 0 bytes in 0 blocks
 ==3667==    indirectly lost: 0 bytes in 0 blocks
@@ -865,31 +1370,16 @@ version: 9.9.8
 ==3667==         suppressed: 0 bytes in 0 blocks
 ==3667== Reachable blocks (those to which a pointer was found) are not shown.
 ==3667== To see them, rerun with: --leak-check=full --show-leak-kinds=all
-    ''');
-    });
-
-    test('some dart tests failed', () {
-      // no "All tests passed!" line
-      expect(
-        () => checkValgrindOutput('''
-==3667== LEAK SUMMARY:
-==3667==    definitely lost: 0 bytes in 0 blocks
-==3667==    indirectly lost: 0 bytes in 0 blocks
-==3667==      possibly lost: 1,216 bytes in 4 blocks
-==3667==    still reachable: 16,530 bytes in 202 blocks
-==3667==         suppressed: 0 bytes in 0 blocks
-==3667== Reachable blocks (those to which a pointer was found) are not shown.
-==3667== To see them, rerun with: --leak-check=full --show-leak-kinds=all
-    '''),
-        throwsA(isA<Exception>()),
+    ''',
+        exitCode: 0,
       );
     });
 
-    test('has definitely lost bytes', () {
+    test('rejects an error reported only on stderr', () {
       expect(
-        () => checkValgrindOutput('''
-00:00 +1: All tests passed!
-
+        () => checkValgrindOutput(
+          stdout: '00:00 +1: All tests passed!',
+          stderr: '''
 ==3667== LEAK SUMMARY:
 ==3667==    definitely lost: 4 bytes in 0 blocks
 ==3667==    indirectly lost: 0 bytes in 0 blocks
@@ -898,16 +1388,34 @@ version: 9.9.8
 ==3667==         suppressed: 0 bytes in 0 blocks
 ==3667== Reachable blocks (those to which a pointer was found) are not shown.
 ==3667== To see them, rerun with: --leak-check=full --show-leak-kinds=all
-    '''),
+    ''',
+          exitCode: 0,
+        ),
         throwsA(isA<Exception>()),
       );
     });
 
-    test('has indirectly lost bytes', () {
+    test('rejects an error reported only on stdout', () {
       expect(
-        () => checkValgrindOutput('''
+        () => checkValgrindOutput(
+          stdout: '''
 00:00 +1: All tests passed!
+==3667== LEAK SUMMARY:
+==3667==    definitely lost: 4 bytes in 0 blocks
+==3667==    indirectly lost: 0 bytes in 0 blocks
+    ''',
+          stderr: '',
+          exitCode: 0,
+        ),
+        throwsA(isA<Exception>()),
+      );
+    });
 
+    test('rejects indirectly lost bytes', () {
+      expect(
+        () => checkValgrindOutput(
+          stdout: '00:00 +1: All tests passed!',
+          stderr: '''
 ==3667== LEAK SUMMARY:
 ==3667==    definitely lost: 0 bytes in 0 blocks
 ==3667==    indirectly lost: 4 bytes in 0 blocks
@@ -916,7 +1424,40 @@ version: 9.9.8
 ==3667==         suppressed: 0 bytes in 0 blocks
 ==3667== Reachable blocks (those to which a pointer was found) are not shown.
 ==3667== To see them, rerun with: --leak-check=full --show-leak-kinds=all
-    '''),
+    ''',
+          exitCode: 0,
+        ),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('rejects a nonzero exit code', () {
+      expect(
+        () => checkValgrindOutput(
+          stdout: '00:00 +1: All tests passed!',
+          stderr: '',
+          exitCode: 1,
+        ),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('rejects output without the test success marker', () {
+      expect(
+        () => checkValgrindOutput(
+          stdout: '',
+          stderr: '''
+==3667== LEAK SUMMARY:
+==3667==    definitely lost: 0 bytes in 0 blocks
+==3667==    indirectly lost: 0 bytes in 0 blocks
+==3667==      possibly lost: 1,216 bytes in 4 blocks
+==3667==    still reachable: 16,530 bytes in 202 blocks
+==3667==         suppressed: 0 bytes in 0 blocks
+==3667== Reachable blocks (those to which a pointer was found) are not shown.
+==3667== To see them, rerun with: --leak-check=full --show-leak-kinds=all
+    ''',
+          exitCode: 0,
+        ),
         throwsA(isA<Exception>()),
       );
     });

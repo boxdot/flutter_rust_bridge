@@ -18,7 +18,9 @@ Config _$parseConfigResult(ArgResults result) => Config()
   ..wasmBindgenArgs = result['wasm-bindgen-args'] as List<String>
   ..wasmPackRustupToolchain = result['wasm-pack-rustup-toolchain'] as String?
   ..wasmPackRustflags = result['wasm-pack-rustflags'] as String?
-  ..dartCompileJsEntrypoint = result['dart-compile-js-entrypoint'] as String?;
+  ..dartCompileJsEntrypoint = result['dart-compile-js-entrypoint'] as String?
+  ..dartCompileWasmEntrypoint =
+      result['dart-compile-wasm-entrypoint'] as String?;
 
 ArgParser _$populateConfigParser(ArgParser parser) => parser
   ..addOption('dart-root', help: 'Root folder of dart package')
@@ -43,12 +45,18 @@ ArgParser _$populateConfigParser(ArgParser parser) => parser
   )
   ..addOption(
     'wasm-pack-rustflags',
-    help: 'Override RUSTFLAGS environment variable when running wasm-pack',
+    help:
+        'Override WebAssembly target Rust compiler flags when running wasm-pack',
   )
   ..addOption(
     'dart-compile-js-entrypoint',
     help:
         'If specified, compile Dart into JavaScript and use this option as entrypoint',
+  )
+  ..addOption(
+    'dart-compile-wasm-entrypoint',
+    help:
+        'If specified, compile Dart into WebAssembly and use this option as entrypoint',
   );
 
 final _$parserForConfig = _$populateConfigParser(ArgParser());
