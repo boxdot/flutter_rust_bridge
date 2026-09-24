@@ -131,15 +131,10 @@ class _QuickstartSmokeContext {
     return context;
   }
 
-  List<String> get flutterRunArgs => [
-    'run',
-    '-d',
-    resolvedDeviceId,
-    if (target == QuickstartSmokeTarget.web) ...[
-      '--web-header=Cross-Origin-Opener-Policy=same-origin',
-      '--web-header=Cross-Origin-Embedder-Policy=require-corp',
-    ],
-  ];
+  List<String> get flutterRunArgs => quickstartSmokeFlutterRunArgsForTesting(
+    target: target,
+    deviceId: resolvedDeviceId,
+  );
 
   Map<String, String> get environment => {
     if (Platform.isLinux) 'DISPLAY': Platform.environment['DISPLAY'] ?? ':99',
@@ -164,6 +159,21 @@ class _QuickstartSmokeContext {
     }
   }
 }
+
+@visibleForTesting
+List<String> quickstartSmokeFlutterRunArgsForTesting({
+  required QuickstartSmokeTarget target,
+  required String deviceId,
+}) => [
+  'run',
+  '-d',
+  deviceId,
+  if (target == QuickstartSmokeTarget.android) '--no-dds',
+  if (target == QuickstartSmokeTarget.web) ...[
+    '--web-header=Cross-Origin-Opener-Policy=same-origin',
+    '--web-header=Cross-Origin-Embedder-Policy=require-corp',
+  ],
+];
 
 class _QuickstartSmokeFlutterRun {
   final Process process;
@@ -534,6 +544,10 @@ void _validateQuickstartSmokeResult({
 Future<void> _captureAndOcrQuickstartSmokeScreenshotFromContext(
   _QuickstartSmokeContext context,
 ) async {
+  if (Platform.isMacOS && context.target == QuickstartSmokeTarget.desktop) {
+    await _activateMacosQuickstartSmokeApp(context.absolutePackage);
+  }
+
   await _captureAndOcrQuickstartSmokeScreenshot(
     target: context.target,
     deviceId: context.resolvedDeviceId,
@@ -667,7 +681,6 @@ Future<void> _captureQuickstartSmokeScreenshot({
 Future<ProcessResult> _captureMacosQuickstartSmokeScreenshot(
   File screenshotFile,
 ) async {
-  await _activateMacosQuickstartSmokeApp();
   return Process.run(
     'screencapture',
     quickstartSmokeMacosScreenshotArgsForTesting(screenshotFile.path),
@@ -675,10 +688,19 @@ Future<ProcessResult> _captureMacosQuickstartSmokeScreenshot(
   );
 }
 
-Future<void> _activateMacosQuickstartSmokeApp() async {
+Future<void> _activateMacosQuickstartSmokeApp(
+  Directory packageDirectory,
+) async {
+  final appPath = quickstartSmokeMacosAppPathForTesting(packageDirectory);
+  print('Activating macOS quickstart app: $appPath');
   final result = await Process.run('osascript', [
     '-e',
-    'tell application "flutter_via_create" to activate',
+    'on run argv',
+    '-e',
+    'tell application (item 1 of argv) to activate',
+    '-e',
+    'end run',
+    appPath,
   ], stderrEncoding: systemEncoding);
   if (result.exitCode != 0) {
     print(
@@ -686,6 +708,25 @@ Future<void> _activateMacosQuickstartSmokeApp() async {
       '(exitCode=${result.exitCode}, stderr=${result.stderr})',
     );
   }
+}
+
+@visibleForTesting
+String quickstartSmokeMacosAppPathForTesting(Directory packageDirectory) {
+  final products = Directory(
+    '${packageDirectory.path}/build/macos/Build/Products/Debug',
+  );
+  final apps = products
+      .listSync()
+      .whereType<Directory>()
+      .where((directory) => directory.path.endsWith('.app'))
+      .toList();
+  if (apps.length != 1) {
+    throw StateError(
+      'Expected one macOS quickstart app in ${products.path}, '
+      'found ${apps.length}',
+    );
+  }
+  return apps.single.absolute.path;
 }
 
 Future<ProcessResult> _captureWindowsQuickstartSmokeScreenshot(

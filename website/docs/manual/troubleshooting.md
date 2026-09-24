@@ -48,6 +48,12 @@ generated rs file is not included when building is being done.
 [ERROR:flutter/lib/ui/ui_dart_state.cc(209)] Unhandled Exception: Invalid argument(s): Failed to lookup symbol 'store_dart_post_cobject': target/debug/libadder.so: undefined symbol: store_dart_post_cobject
 ```
 
+## Google Play reports missing 16 KB page size support
+
+For Native Assets, try upgrading Android Gradle Plugin (AGP) to **8.5.1+** and using **NDK r28+**, then rebuild. This resolved [#3421](https://github.com/fzyzcjy/flutter_rust_bridge/issues/3421) without changing linker flags.
+
+See the [Android guide](https://developer.android.com/guide/practices/page-sizes#build) for verification and prebuilt dependency requirements.
+
 ## Error running `cargo ndk`: `ld: error: unable to find library -lgcc`
 
 Downgrade Android NDK to version 22. This is an [ongoing issue](https://github.com/bbqsrc/cargo-ndk/issues/22)
@@ -69,6 +75,8 @@ You can install llvm using `brew install llvm` and it will be installed at `/usr
 With automatic `build_runner` invocation enabled, code generation runs `build_runner` 1.7.0 or newer for required `.freezed.dart` outputs and, when JSON serialization is needed, `.g.dart` outputs under the configured `dart_output` directory. If those files seem outdated, ensure `build_runner`, `freezed`, and the corresponding annotations are installed.
 
 Run `build_runner` separately when the Dart package contains unrelated builders whose outputs live outside `dart_output`. The automatic invocation uses output filters to scope work to FRB-generated outputs. For non-library output paths that build_runner 1.7 cannot represent safely as filters, it falls back to an unfiltered build to preserve generation correctness.
+
+Code generation streams child command output, including `build_runner`, when run with `--verbose`. If Polish looks stuck, re-run with `--verbose` and look at those lines first (for example `freezed on N inputs` or an analyzer exception).
 
 Related: https://github.com/fzyzcjy/flutter_rust_bridge/issues/330
 

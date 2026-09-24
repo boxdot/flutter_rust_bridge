@@ -24,7 +24,13 @@ impl WireDartCodecDcoGeneratorDecoderTrait for BoxedWireDartCodecDcoGenerator<'_
                 MirTypePrimitive::I64
                 | MirTypePrimitive::Isize
                 | MirTypePrimitive::U64
-                | MirTypePrimitive::Usize,
+                | MirTypePrimitive::Usize
+                | MirTypePrimitive::U8
+                | MirTypePrimitive::I8
+                | MirTypePrimitive::U16
+                | MirTypePrimitive::I16
+                | MirTypePrimitive::U32
+                | MirTypePrimitive::I32,
             )
             | Delegate(MirTypeDelegate::Array(_) | MirTypeDelegate::PrimitiveEnum { .. }) => {
                 format!("return dco_decode_{}(raw);", self.mir.inner.safe_ident())
@@ -35,5 +41,31 @@ impl WireDartCodecDcoGeneratorDecoderTrait for BoxedWireDartCodecDcoGenerator<'_
             }
             _ => gen_decode_simple_type_cast(self.mir.clone().into(), self.context),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::generator::wire::dart::spec_generator::codec::dco::decoder::ty::test_utils;
+    use crate::codegen::ir::mir::ty::boxed::MirTypeBoxed;
+
+    /// Delegates boxed 64-bit integers to their dedicated decoder.
+    #[test]
+    fn boxed_decoder_delegates_i64_to_inner_decoder() {
+        let pack = test_utils::pack();
+        let config = test_utils::config();
+        let generator = BoxedWireDartCodecDcoGenerator::new(
+            MirTypeBoxed {
+                exist_in_real_api: true,
+                inner: Box::new(MirType::Primitive(MirTypePrimitive::I64)),
+            },
+            test_utils::context(&pack, &config),
+        );
+
+        assert_eq!(
+            generator.generate_impl_decode_body(),
+            "return dco_decode_i_64(raw);"
+        );
     }
 }

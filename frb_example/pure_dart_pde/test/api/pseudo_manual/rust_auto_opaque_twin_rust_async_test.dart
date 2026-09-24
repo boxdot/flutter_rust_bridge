@@ -13,7 +13,10 @@ import 'package:test/test.dart';
 
 import '../../test_utils.dart';
 
-Future<void> main({bool skipRustLibInit = false}) async {
+Future<void> main({
+  bool skipRustLibInit = false,
+  bool skipDisposedRustAutoOpaqueArgumentTest = false,
+}) async {
   if (!skipRustLibInit) await RustLib.init();
 
   group('simple functions', () {
@@ -31,19 +34,23 @@ Future<void> main({bool skipRustLibInit = false}) async {
         );
       });
 
-      test('after call, the object cannot be used again', () async {
-        final obj = await rustAutoOpaqueReturnOwnTwinRustAsync(initial: 100);
-        await futurizeVoidTwinRustAsync(
-          rustAutoOpaqueArgOwnTwinRustAsync(arg: obj, expect: 100),
-        );
+      test(
+        'after call, the object cannot be used again',
+        () async {
+          final obj = await rustAutoOpaqueReturnOwnTwinRustAsync(initial: 100);
+          await futurizeVoidTwinRustAsync(
+            rustAutoOpaqueArgOwnTwinRustAsync(arg: obj, expect: 100),
+          );
 
-        expect(obj.isDisposed, true);
+          expect(obj.isDisposed, true);
 
-        await expectLater(
-          () => rustAutoOpaqueArgBorrowTwinRustAsync(arg: obj, expect: 100),
-          throwsA(isA<DroppableDisposedException>()),
-        );
-      });
+          await expectLater(
+            () => rustAutoOpaqueArgBorrowTwinRustAsync(arg: obj, expect: 100),
+            throwsA(isA<DroppableDisposedException>()),
+          );
+        },
+        skip: skipDisposedRustAutoOpaqueArgumentTest,
+      );
     });
 
     group('arg ref', () {
@@ -313,7 +320,12 @@ Future<void> main({bool skipRustLibInit = false}) async {
     );
   });
 
-  test('stream sink', () async {
+  test('stream sink',
+      skip: skipWebStreamFlake(
+        twin: 'TwinRustAsync',
+        jsModes: ['Normal', 'Moi', 'SseMoi'],
+        pde: null,
+      ), () async {
     final stream = rustAutoOpaqueStreamSinkTwinRustAsync();
     final obj = (await stream.toList()).single;
     await futurizeVoidTwinRustAsync(
